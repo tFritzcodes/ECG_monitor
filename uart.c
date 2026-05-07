@@ -4,11 +4,11 @@
  * Created: 5/4/2026 3:09:34 PM
  *  Author: fritz
  */ 
-/* =========================================================================
- * UART  (115200 baud, U2X=1 double-speed for accuracy at 16 MHz)
- * UBRR = F_CPU / (8 * BAUD) - 1 = 16000000 / 921600 - 1 = 16.36 -> 16
- * Actual baud = 16000000 / (8 * 17) = 117647  (error ~2.1%, within spec)
- * ========================================================================= */
+
+// * UART  (115200 baud, U2X=1 double-speed for accuracy at 16 MHz)
+//* UBRR = F_CPU / (8 * BAUD) - 1 = 16000000 / 921600 - 1 = 16.36 -> 16
+//* Actual baud = 16000000 / (8 * 17) = 117647
+
 #include <avr/io.h>
 #include "uart.h"
 

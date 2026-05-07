@@ -1,21 +1,4 @@
-/*
- * =========================================================================
- * ECE301 - Pan-Tompkins QRS Detection
- * ATmega328P — Microchip Studio / AVR-GCC
- *
- * Build target : ATmega328P, 16 MHz
- * Toolchain    : AVR-GCC
- *
- * Serial protocol (115200 8N1):
- *   Host sends  : ASCII decimal int16 sample followed by '\n'
- *   Device sends: 'Q\r\n' on QRS, 'N\r\n' otherwise
- *
- * Filter chain (Pan & Tompkins, 1985):
- *   raw -> LPF -> HPF -> derivative -> square -> MWI -> threshold
- *
- * MATLAB scaling: use SCALE = 1000
- * =========================================================================
- */
+//ECE 301 Final Project Ted Fritzenmeier, Alex Zimmermann, Evan Gould, Carlos Juarez, Wesley Sauder
 #define F_CPU 16000000UL
 
 #include <avr/io.h>
@@ -27,66 +10,48 @@
 #include "uart.h"
 
 
+//Fs = 360 Hz
+// LPF: H(z) = (1 - z^-6)^2 / (1 - z^-1)^2
+//   y(n) = 2y(n-1) - y(n-2) + x(n) - 2x(n-6) + x(n-12)
 
-/* =========================================================================
- * PARAMETERS  (FS = 360 Hz)
- * =========================================================================
- *
- * LPF:
- *   H(z) = (1 - z^-6)^2 / (1 - z^-1)^2
- *   y(n) = 2y(n-1) - y(n-2) + x(n) - 2x(n-6) + x(n-12)
- *   Delay line: 13 slots (indices 0..12)
- *   DC gain = 36; we divide output by 32 (>>5) — close enough.
- *
- * HPF:
- *   Implemented as: allpass - LPF (delay-32 version)
- *   y(n) = y(n-1) - (1/32)x(n) + x(n-16) - x(n-17) + (1/32)x(n-32)
- *   Delay line: 33 slots (indices 0..32)
- *
- * Derivative (5-point):
- *   y(n) = (1/8)[2x(n) + x(n-1) - x(n-3) - 2x(n-4)]
- *
- * MWI: 150 ms rectangular window = 54 samples at 360 Hz
- *
- * Refractory: 200 ms = 72 samples
- * Bootstrap:    2 s  = 720 samples
- * ========================================================================= */
+// HPF: y(n) = y(n-1) - (1/32)x(n) + x(n-16) - x(n-17) + (1/32)x(n-32)
+
+// Derivative (5-point):
+//  y(n) = (1/8)[2x(n) + x(n-1) - x(n-3) - 2x(n-4)]
+ 
+// MWI: 150 ms rectangular window = 54 samples at 360 Hz
+// Refractory: 200 ms = 72 samples
+// Bootstrap:    2 s  = 720 samples
 
 #define FS               360
 #define REFRACTORY_SAMP  72
 #define BOOT_SAMPLES     720
 
-/* ---------- LPF ---------- */
+//parameters
+
+// Low-pass filter
 #define LPF_N   13
 static int32_t lpf_x[LPF_N];
 static int32_t lpf_y1 = 0, lpf_y2 = 0;
 static uint8_t lpf_head = 0;
 
-/* ---------- HPF ---------- */
+// High-pass filter
 #define HPF_N   33
 static int32_t hpf_x[HPF_N];
 static int32_t hpf_y = 0;
 static uint8_t hpf_head = 0;
 
-/* ---------- Derivative ---------- */
+// Derivative
 static int32_t drv_x[5];
 static uint8_t drv_head = 0;
 
-/* ---------- MWI ---------- */
+// Moving-window integrator
 #define MWI_N   54
 static int32_t mwi_x[MWI_N];
 static int32_t mwi_sum = 0;
 static uint8_t mwi_head = 0;
 
-/* =========================================================================
- * FILTERS
- * ========================================================================= */
-
-/*
- * Low-pass filter
- *   y(n) = 2y(n-1) - y(n-2) + x(n) - 2x(n-6) + x(n-12)
- *   Output divided by 32 to normalise gain.
- */
+//Low pass filter
 static int32_t lpf(int32_t x)
 {
     lpf_x[lpf_head] = x;
@@ -106,13 +71,7 @@ static int32_t lpf(int32_t x)
     return y >> 5;
 }
 
-/*
- * High-pass filter
- *   y(n) = y(n-1) - x(n)/32 + x(n-16) - x(n-17) + x(n-32)/32
- *
- * The /32 terms use arithmetic right-shift. This keeps the accumulator
- * stable — no unbounded drift.
- */
+// High-pass filter
 static int32_t hpf(int32_t x)
 {
     hpf_x[hpf_head] = x;
@@ -132,10 +91,7 @@ static int32_t hpf(int32_t x)
     return hpf_y;
 }
 
-/*
- * Five-point derivative
- *   y(n) = (1/8)[2x(n) + x(n-1) - x(n-3) - 2x(n-4)]
- */
+//derivative
 static int32_t derivative(int32_t x)
 {
     drv_x[drv_head] = x;
@@ -153,13 +109,7 @@ static int32_t derivative(int32_t x)
     return y;
 }
 
-/*
- * Squaring
- * Clamp to +-1000 before squaring.
- * At SCALE=1000 input, after LPF+HPF+derivative the signal
- * typically peaks around 200-600, so +-1000 gives headroom
- * without overflow (1000^2 = 1,000,000 fits in int32).
- */
+//Squaring: limit input to +/-1000 to avoid overflow, then square
 static int32_t squarer(int32_t x)
 {
     if (x >  1000) x =  1000;
@@ -167,9 +117,7 @@ static int32_t squarer(int32_t x)
     return x * x;
 }
 
-/*
- * Moving-window integrator (150 ms = 54 samples)
- */
+// Moving-window integrator (150 ms = 54 samples)
 static int32_t mwi(int32_t x)
 {
     mwi_sum          -= mwi_x[mwi_head];
@@ -179,9 +127,7 @@ static int32_t mwi(int32_t x)
     return mwi_sum / MWI_N;
 }
 
-/* =========================================================================
- * DETECTOR STATE
- * ========================================================================= */
+// Adaptive thresholding and QRS detection state
 static int32_t  spki        = 0;
 static int32_t  npki        = 0;
 static int32_t  thresh1     = 0;
@@ -195,9 +141,7 @@ static uint16_t refractory  = 0;
 static int32_t  prev_val    = 0;
 static bool     is_rising   = false;
 
-/* =========================================================================
- * PROCESS ONE SAMPLE
- * ========================================================================= */
+//process a single sample through the pipeline and return true if a QRS complex is detected
 static bool process_sample(int16_t raw)
 {
     int32_t s1 = lpf((int32_t)raw);
@@ -206,7 +150,7 @@ static bool process_sample(int16_t raw)
     int32_t s4 = squarer(s3);
     int32_t s5 = mwi(s4);
 
-    /* ---- Bootstrap: 2 s warmup to seed thresholds ---- */
+    // During the initial bootstrapping phase, we just look for the maximum value to set our initial thresholds. (2s)
     if (!initialized)
     {
         if (s5 > boot_max) boot_max = s5;
@@ -215,21 +159,19 @@ static bool process_sample(int16_t raw)
         if (boot_count >= BOOT_SAMPLES)
         {
             spki    = boot_max;
-            npki    = boot_max >> 2;                    /* noise = 25% of max    */
-            thresh1 = npki + ((spki - npki) >> 2);     /* 25% between N and S   */
+            npki    = boot_max >> 2;                    // noise = 25% of max    
+            thresh1 = npki + ((spki - npki) >> 2);     // 25% between N and S   
 
             initialized = true;
             refractory  = REFRACTORY_SAMP;
             prev_val    = 0;
             is_rising   = false;
 
-            /* Reset HPF accumulator — it drifts during warmup */
             hpf_y = 0;
         }
         return false;
     }
 
-    /* ---- Hard refractory block ---- */
     if (refractory > 0)
     {
         refractory--;
@@ -237,7 +179,7 @@ static bool process_sample(int16_t raw)
         return false;
     }
 
-    /* ---- Local peak detection ---- */
+    // Peak detection with adaptive thresholding
     bool qrs = false;
 
     if (s5 > prev_val)
@@ -246,7 +188,6 @@ static bool process_sample(int16_t raw)
     }
     else if (is_rising && (s5 < prev_val))
     {
-        /* local maximum was at prev_val */
         if (prev_val >= thresh1)
         {
             qrs        = true;
@@ -262,16 +203,14 @@ static bool process_sample(int16_t raw)
 
     prev_val = s5;
 
-    /* ---- Adaptive threshold update ---- */
+    // Update adaptive threshold
     thresh1 = npki + ((spki - npki) >> 2);
     if (thresh1 < 1) thresh1 = 1;
 
     return qrs;
 }
 
-/* =========================================================================
- * MAIN
- * ========================================================================= */
+
 int main(void)
 {
     uart_init();
@@ -284,7 +223,7 @@ int main(void)
     lpf_y1 = 0;  lpf_y2 = 0;
     hpf_y  = 0;
 
-    /* Tell MATLAB the device is ready to receive */
+    // Tell MATLAB the device is ready to receive samples
     uart_puts("READY\r\n");
 
     char    rx_buf[12];
@@ -294,6 +233,7 @@ int main(void)
     {
         if (!uart_rx_ready()) continue;
 
+        // Read characters until we get a newline, then process the line as a sample value
         char c = uart_getc();
 
         if (c == '\n')
