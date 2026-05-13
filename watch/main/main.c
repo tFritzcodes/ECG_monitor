@@ -142,7 +142,7 @@ static esp_err_t max30102_init(void)
     if (e != ESP_OK) return e;
 
     /* SpO2 config: ADC range 4096 nA, 200 Hz sample rate, 215 µs pulse width (16-bit).
-     * 200 Hz matches the Pan-Tompkins paper exactly; 215 µs is the max PW at this rate. */
+     * 200 Hz is the practical max for MAX30102; Pan-Tompkins paper used 360 Hz. */
     e = i2c_write_byte(MAX30102_ADDR, 0x0A, (uint8_t)((0b11 << 5) | (0b010 << 2) | 0b10));
     if (e != ESP_OK) return e;
 

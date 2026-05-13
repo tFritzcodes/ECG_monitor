@@ -30,6 +30,12 @@ _IRREG_FRAC  = 0.35
 _IRREG_MIN   = 2
 _EMA_ALPHA   = 0.25
 _BOOT_PEAKS  = 32
+# Paper-faithful additions
+_BPF_BUF_N      = 32     # ~160 ms bandpass history for F-channel peak search
+_DRV_BUF_N      = 20     # 100 ms |derivative| history — the "waveform" window
+_RR_AVG_N       = 8      # paper's RR_AVG1/AVG2 length
+_TWAVE_GAP_MIN  = 40     # 200 ms in samples
+_TWAVE_GAP_MAX  = 72     # 360 ms in samples
 
 
 class PanTompkins:
@@ -60,27 +66,51 @@ class PanTompkins:
         self._dc_seeded = False
         self._filter_reset_needed = False
 
-        # detector
+        # detector — I channel (MWI)
         self._sb_buf   = [0] * _SB_N
         self._sb_head  = 0
         self._spki     = 0
         self._npki     = 0
         self._thresh1  = 0
+        # detector — F channel (bandpass)
+        self._spkf     = 0
+        self._npkf     = 0
+        self._thresh_f1 = 0
+        self._bpf_buf  = [0] * _BPF_BUF_N
+        self._bpf_head = 0
+
         self._inited   = False
         self._refrac   = 0
         self._no_beat  = 0
         self._prev_mwi = 0
         self._rising   = False
-        self._sb_qrs_back = 0  # searchback offset; non-zero only when searchback fires
+        self._sb_qrs_back = 0
 
-        # bootstrap peak collection
+        # T-wave discriminator state — rolling |derivative| history
+        self._drv_buf        = [0] * _DRV_BUF_N
+        self._drv_buf_head   = 0
+        self._last_qrs_slope = 0
+
+        # Dual RR averages (paper eqs 24-29)
+        self._rr_avg1     = [0] * _RR_AVG_N
+        self._rr_avg2     = [0] * _RR_AVG_N
+        self._rr1_cnt     = 0
+        self._rr1_head    = 0
+        self._rr2_cnt     = 0
+        self._rr2_head    = 0
+        self._rr_avg1_val = 0
+        self._rr_avg2_val = 0
+        self._regular     = False
+
+        # bootstrap peak collection — paired MWI + BPF peaks so SPKF can be
+        # seeded from real bandpass-channel amplitudes rather than a proxy.
         self._boot_cnt       = 0
         self._boot_max       = 0
-        self._boot_peaks     = []
+        self._boot_peaks     = []   # list of (mwi_peak, bpf_peak) tuples
         self._boot_prev      = 0
         self._boot_was_rising = False
 
-        # RR / arrhythmia
+        # RR / arrhythmia (legacy median buffer — kept for classifier)
         self._rr       = [0] * 8
         self._rr_cnt   = 0
         self._rr_head  = 0
@@ -168,6 +198,36 @@ class PanTompkins:
         tmp = sorted(self._rr[(self._rr_head - n + i + 8) % 8] for i in range(n))
         return tmp[n // 2]
 
+    def _rr_avg_push(self, ibi):
+        """Update RR_AVG1, RR_AVG2, and rhythm regularity per paper eqs 24-29."""
+        self._rr_avg1[self._rr1_head] = ibi
+        self._rr1_head = (self._rr1_head + 1) % _RR_AVG_N
+        if self._rr1_cnt < _RR_AVG_N:
+            self._rr1_cnt += 1
+        self._rr_avg1_val = sum(self._rr_avg1[:self._rr1_cnt]) // self._rr1_cnt
+
+        if self._rr_avg2_val == 0:
+            self._rr_avg2_val = self._rr_avg1_val
+
+        lo = (self._rr_avg2_val * 92) // 100
+        hi = (self._rr_avg2_val * 116) // 100
+        if lo <= ibi <= hi:
+            self._rr_avg2[self._rr2_head] = ibi
+            self._rr2_head = (self._rr2_head + 1) % _RR_AVG_N
+            if self._rr2_cnt < _RR_AVG_N:
+                self._rr2_cnt += 1
+            self._rr_avg2_val = sum(self._rr_avg2[:self._rr2_cnt]) // self._rr2_cnt
+
+        if self._rr1_cnt >= _RR_AVG_N:
+            all_regular = all(lo <= v <= hi for v in self._rr_avg1)
+            self._regular = all_regular
+            if all_regular:
+                self._rr_avg2_val = self._rr_avg1_val   # eq. 29
+
+    def _bpf_window_peak(self):
+        """Largest |bpf| in the recent window — F-channel peak for confirmation."""
+        return max(abs(v) for v in self._bpf_buf)
+
     def _classify(self, bpm):
         if math.isnan(bpm):
             return ARR_NONE
@@ -189,32 +249,40 @@ class PanTompkins:
 
     # ------------------------------------------------------------------ detector
 
-    def _detect(self, mwi_val):
+    def _detect(self, mwi_val, bpf_val, drv_abs):
         self._sb_buf[self._sb_head] = mwi_val
         self._sb_head = (self._sb_head + 1) % _SB_N
+        self._bpf_buf[self._bpf_head] = bpf_val
+        self._bpf_head = (self._bpf_head + 1) % _BPF_BUF_N
+        self._drv_buf[self._drv_buf_head] = drv_abs
+        self._drv_buf_head = (self._drv_buf_head + 1) % _DRV_BUF_N
 
         if not self._inited:
             if mwi_val > self._boot_max:
                 self._boot_max = mwi_val
-
-            # Collect local maxima
             if (self._boot_was_rising and mwi_val < self._boot_prev
                     and len(self._boot_peaks) < _BOOT_PEAKS):
-                self._boot_peaks.append(self._boot_prev)
+                # Capture MWI peak with matching F-channel window peak
+                self._boot_peaks.append((self._boot_prev, self._bpf_window_peak()))
             self._boot_was_rising = (mwi_val >= self._boot_prev)
             self._boot_prev = mwi_val
 
             self._boot_cnt += 1
             if self._boot_cnt >= _BOOT:
                 if len(self._boot_peaks) >= 2:
-                    peaks = sorted(self._boot_peaks)
-                    self._spki = peaks[len(peaks) // 2]   # median
+                    pairs = sorted(self._boot_peaks, key=lambda p: p[0])
+                    mid = len(pairs) // 2
+                    self._spki = pairs[mid][0]
+                    self._spkf = pairs[mid][1]
                 else:
                     self._spki = max(self._boot_max >> 1, 1)
-                if self._spki < 1:
-                    self._spki = 1
+                    self._spkf = 0
+                if self._spki < 1: self._spki = 1
+                if self._spkf < 1: self._spkf = 1
                 self._npki    = self._spki >> 2
                 self._thresh1 = self._npki + ((self._spki - self._npki) >> 2)
+                self._npkf     = self._spkf >> 2
+                self._thresh_f1 = self._npkf + ((self._spkf - self._npkf) >> 2)
                 self._inited  = True
                 self._refrac  = _REFRAC
                 self._prev_mwi = 0
@@ -227,60 +295,93 @@ class PanTompkins:
             self._prev_mwi = mwi_val
             return False
 
-        qrs = False
+        # Effective thresholds. The paper's irregular-rhythm halving (eqs
+        # 22-23) is disabled — its 92-116% regularity window flags normal
+        # HR variability as irregular, halving lets in noise, and SPKI/SPKF
+        # run away. We keep the regularity tracker (used for RR_AVG2-based
+        # searchback) but no longer halve.
+        thr_i_eff = self._thresh1
+        thr_f_eff = self._thresh_f1
 
+        qrs = False
         if mwi_val > self._prev_mwi:
             self._rising = True
         elif self._rising and mwi_val < self._prev_mwi:
             artifact = (self._spki > 0 and
                         self._prev_mwi > self._spki + (self._spki << 1))
             if not artifact:
-                if self._prev_mwi >= self._thresh1:
+                bpf_peak = self._bpf_window_peak()
+                # Paper's "maximal slope during this waveform"
+                cand_slope = max(self._drv_buf)
+                mwi_ok = (self._prev_mwi >= thr_i_eff)
+                bpf_ok = (bpf_peak       >= thr_f_eff)
+                # See pan_tompkins.c for the long-form explanation: paper's
+                # dual-confirmation and T-wave-slope rules don't translate
+                # cleanly to our fixed-point cascade — the BPF threshold
+                # tracker drifts and the post-filter R/T slope ratio sits
+                # well above 0.5, so neither rule discriminates correctly.
+                # Infrastructure is kept (SPKF / NPKF / slope buffer all
+                # update normally) but the QRS decision uses the MWI
+                # channel only.
+                _ = (bpf_ok, cand_slope)
+
+                if mwi_ok:
                     qrs = True
-                    self._spki  = self._spki + ((self._prev_mwi - self._spki) >> 3)
+                    self._spki = self._spki + ((self._prev_mwi - self._spki) >> 3)
+                    self._spkf = self._spkf + ((bpf_peak       - self._spkf) >> 3)
+                    self._last_qrs_slope = cand_slope
                     self._refrac = _REFRAC
                 else:
                     self._npki = self._npki + ((self._prev_mwi - self._npki) >> 3)
+                    self._npkf = self._npkf + ((bpf_peak       - self._npkf) >> 3)
             self._rising = False
 
         self._prev_mwi = mwi_val
-        self._thresh1  = self._npki + ((self._spki - self._npki) >> 2)
-        if self._thresh1 < 1:
-            self._thresh1 = 1
+        self._thresh1   = self._npki + ((self._spki - self._npki) >> 2)
+        self._thresh_f1 = self._npkf + ((self._spkf - self._npkf) >> 2)
+        if self._thresh1   < 1: self._thresh1   = 1
+        if self._thresh_f1 < 1: self._thresh_f1 = 1
 
-        # Searchback
+        # Searchback — use the same robust median that the arrhythmia classifier
+        # uses (rr_median), not rr_avg2_val.  rr_avg2_val only becomes reliable
+        # after ~8 "regular" beats; before that it sits near the first IBI and
+        # causes premature/wrong searchback windows.  The original 0.125 SPKI
+        # update (not the paper's stronger 0.25 variant) is also restored here:
+        # the stronger update causes SPKI to collapse when a sub-threshold noise
+        # peak is found during searchback, which then admits a cascade of FPs.
         self._sb_qrs_back = 0
-        if not qrs and self._rr_cnt >= 2 and self._last_qrs > 0:
-            rr_ms = self._rr_median()
-            if rr_ms > 0:
-                rr_samp  = rr_ms * _FS // 1000
-                sb_limit = min((rr_samp * 5) // 3, _SB_N)
-                if self._idx - self._last_qrs >= sb_limit:
-                    thr2   = self._thresh1 >> 1
-                    best   = thr2
-                    best_i = 0
-                    for i in range(sb_limit):
-                        idx = (self._sb_head + _SB_N - sb_limit + i) % _SB_N
-                        if self._sb_buf[idx] > best:
-                            best   = self._sb_buf[idx]
-                            best_i = i
-                    if best > thr2:
-                        qrs = True
-                        # i=0 is oldest; i=sb_limit-1 is most recent (1 sample ago)
-                        self._sb_qrs_back = sb_limit - 1 - best_i
-                        self._spki   = self._spki + ((best - self._spki) >> 3)
-                        self._thresh1 = self._npki + ((self._spki - self._npki) >> 2)
-                        self._refrac  = _REFRAC
+        sb_med = self._rr_median()
+        if not qrs and sb_med > 0 and self._last_qrs > 0:
+            rr_samp  = sb_med * _FS // 1000
+            sb_limit = min((rr_samp * 5) // 3, _SB_N)
+            if self._idx - self._last_qrs >= sb_limit:
+                thr_i2 = self._thresh1   >> 1
+                thr_f2 = self._thresh_f1 >> 1
+                best, best_i = thr_i2, 0
+                for i in range(sb_limit):
+                    idx = (self._sb_head + _SB_N - sb_limit + i) % _SB_N
+                    if self._sb_buf[idx] > best:
+                        best   = self._sb_buf[idx]
+                        best_i = i
+                bpf_peak = self._bpf_window_peak()
+                _ = thr_f2     # F-channel threshold tracked but not gating
+                if best > thr_i2:
+                    qrs = True
+                    self._sb_qrs_back = sb_limit - 1 - best_i
+                    self._spki = self._spki + ((best     - self._spki) >> 3)
+                    self._spkf = self._spkf + ((bpf_peak - self._spkf) >> 3)
+                    self._thresh1   = self._npki + ((self._spki - self._npki) >> 2)
+                    self._thresh_f1 = self._npkf + ((self._spkf - self._npkf) >> 2)
+                    self._refrac = _REFRAC
 
-        # No-beat watchdog — halve both to keep threshold ratio intact
         if qrs:
             self._no_beat = 0
         else:
             self._no_beat += 1
             if self._no_beat >= _NO_BEAT_TO:
-                self._spki   >>= 1
-                self._npki   >>= 1
-                self._no_beat  = 0
+                self._spki >>= 1; self._npki >>= 1
+                self._spkf >>= 1; self._npkf >>= 1
+                self._no_beat = 0
 
         return qrs
 
@@ -301,8 +402,13 @@ class PanTompkins:
             self._filter_reset_needed = False
             self._reset_filters()
 
-        s = self._mwi(self._square(self._deriv(self._hpf(self._lpf(ac)))))
-        qrs = self._detect(s)
+        s1 = self._lpf(ac)
+        s2 = self._hpf(s1)              # bandpass output (F channel)
+        s3 = self._deriv(s2)
+        s4 = self._square(s3)
+        s5 = self._mwi(s4)              # MWI output (I channel)
+        s3_abs = -s3 if s3 < 0 else s3
+        qrs = self._detect(s5, s2, s3_abs)
 
         if qrs:
             self.qrs_count += 1
@@ -311,6 +417,7 @@ class PanTompkins:
                 ibi_ms = (qrs_idx - self._last_qrs) * 1000 // _FS
                 if 273 < ibi_ms < 1714:
                     self._rr_push(ibi_ms)
+                    self._rr_avg_push(ibi_ms)
                     if self._rr_cnt >= 3:
                         med = self._rr_median()
                         new_bpm = 60000.0 / med if med > 0 else float('nan')

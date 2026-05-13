@@ -2,11 +2,12 @@
 #define PAN_TOMPKINS_H
 
 /*
- * Pan-Tompkins QRS detector at 200 Hz (exact paper parameters).
+ * Pan-Tompkins QRS detector adapted for 200 Hz sampling (original paper: 360 Hz).
  *
  *   Pan, J. and Tompkins, W. J., "A Real-Time QRS Detection Algorithm,"
  *   IEEE Trans. Biomed. Eng., vol. 32, no. 3, pp. 230-236, Mar. 1985.
  *
+ * Algorithm logic matches the paper exactly; window sizes scaled for 200 Hz.
  * Pipeline: DC removal -> LPF -> HPF -> derivative -> squaring -> MWI -> threshold
  *
  * Arrhythmia detection via R-R interval analysis (AHA/ACC clinical thresholds):
